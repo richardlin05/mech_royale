@@ -62,6 +62,7 @@ class Arena:
                         self.blocked.add(cell)
         self.path = []
         self.destination = None
+        self.anchor = None
         self.replan_at = 0
 
     def cell(self, pos):
@@ -106,18 +107,29 @@ class Arena:
         return best
 
     def waypoint(self, pos, goal, now):
-        start, end = self.cell(pos), self.cell(goal)
+        start, requested = self.cell(pos), self.cell(goal)
         if not self.open(start):
-            return goal
+            return goal  # The ground grid does not describe travel on a roof.
+        end = requested
         if not self.open(end):
             nearby = ((end[0] + dx, end[1] + dy) for dx in range(-4, 5) for dy in range(-4, 5))
-            end = min((c for c in nearby if self.open(c)), key=lambda c: math.dist(self.point(c), goal[:2]), default=start)
-        if self.destination != end or now >= self.replan_at:
+            end = min((c for c in nearby if self.open(c)),
+                      key=lambda c: math.dist(self.point(c), goal[:2]), default=requested)
+        if start == end:
+            # A blocked goal such as a zone center inside a building has a safe
+            # substitute. Stay at that point once reached.
+            return goal if end == requested else self.point(end)
+
+        off_path = start != self.anchor and (not self.path or start != self.path[-1])
+        if self.destination != end or now >= self.replan_at or off_path:
             self.destination, self.replan_at = end, now + 1.5
+            self.anchor = start
             self.path = self.route(start, end)
-        while self.path and math.dist(pos[:2], self.point(self.path[-1])) < 3.5:
-            self.path.pop()
-        return self.point(self.path[-1]) if self.path else goal
+        if self.path and start == self.path[-1]:
+            self.anchor = self.path.pop()
+        # The search may end at the closest reachable point, for example across
+        # a wall. Wait here for a replan instead of driving into the wall.
+        return self.point(self.path[-1]) if self.path else pos
 
     def route(self, start, end):
         # Bound work per observation. A partial route still advances toward the goal.

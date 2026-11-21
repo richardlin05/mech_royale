@@ -19,7 +19,22 @@ def direction(a, b):
     return [(b[i] - a[i]) / length for i in range(2)]
 
 
-def loot_goal(obs, center, radius):
+def reachable_loot_level(pos, spot, arena):
+    """Keep pickup-height limits near the mech, but allow travel along sloping ground."""
+    if abs(pos[2] - spot[2]) <= 4:
+        return True
+    if arena is None or distance(pos, spot) <= 4:
+        return False
+    # Ground height changes across the map. A weapon 6 m higher on a hillside
+    # can be collected at arrival; one 6 m above the ground on a roof cannot.
+    for point in (pos, spot):
+        cell = arena.cell(point)
+        if not arena.open(cell) or abs(point[2] - arena.ground[cell]) > 2.5:
+            return False
+    return True
+
+
+def loot_goal(obs, center, radius, arena=None):
     me = obs["self"]
     pos = me["pos"]
     items = [(c, -8) for c in obs["cubes"]]
@@ -27,7 +42,7 @@ def loot_goal(obs, center, radius):
         items.extend((p, 5) for p in obs["pickups"] if p["kind"] != "gun")
     options = [(distance(pos, item["pos"]) + penalty, item["pos"])
                for item, penalty in items
-               if abs(item["pos"][2] - pos[2]) <= 4
+               if reachable_loot_level(pos, item["pos"], arena)
                and distance(item["pos"], center) <= radius
                and distance(item["pos"], pos) <= 105]
     for drop in obs.get("drops", []):
@@ -38,13 +53,13 @@ def loot_goal(obs, center, radius):
             options.append((travel * 0.55 - 32, drop["pos"]))
     if not options:
         for crate in obs["crates"]:
-            if distance(pos, crate["pos"]) < 90 and abs(crate["pos"][2] - pos[2]) < 5:
+            if distance(pos, crate["pos"]) < 90 and reachable_loot_level(pos, crate["pos"], arena):
                 if distance(crate["pos"], center) <= radius:
                     options.append((distance(pos, crate["pos"]), crate["pos"]))
     return min(options)[1] if options else None
 
 
-def early_loot(obs, center, radius):
+def early_loot(obs, center, radius, arena=None):
     """Allow a short detour only when we can still walk to safety before shrink starts."""
     me, zone = obs["self"], obs["zone"]
     remaining = zone["shrink_start"] - obs["t"]
@@ -58,7 +73,7 @@ def early_loot(obs, center, radius):
     for item in items:
         spot = item["pos"]
         outward = distance(pos, spot)
-        if outward > 24 or abs(pos[2] - spot[2]) > 4:
+        if outward > 24 or not reachable_loot_level(pos, spot, arena):
             continue
         if distance(spot, zone["center"]) + 6 > zone["radius"]:
             continue
@@ -177,9 +192,12 @@ class Bot:
         self.cover_goal = None
         self.next_cover_search = 0
         self.target_id = None
+        self.last_hit_bearing = None
+        self.watch_bearing_until = -1
         self.sample = None
         self.detour_until = -1
         self.last_moving = False
+        self.recharging = False
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me, zone, t = obs["self"], obs["zone"], obs["t"]
@@ -191,9 +209,9 @@ class Bot:
         crowded = sum(distance(pos, e["pos"]) < 110 for e in enemies) >= 2
         retreat = bool(enemies) and (hurt or crowded)
         rotate = not me["in_zone"] or distance(pos, center) > radius
-        goal = center if rotate else loot_goal(obs, center, radius)
+        goal = center if rotate else loot_goal(obs, center, radius, self.arena)
         if rotate and not enemies:
-            detour_goal = early_loot(obs, center, radius)
+            detour_goal = early_loot(obs, center, radius, self.arena)
             if detour_goal is not None:
                 goal = detour_goal
         move = direction(pos, goal) if goal is not None else [0.0, 0.0]
@@ -246,8 +264,16 @@ class Bot:
             move = [0.0, 0.0]
             detour = False
         self.last_moving = any(move)
+        # Starting another sprint resets the regeneration delay. Bank enough energy
+        # for a sustained sprint before resuming after depletion.
+        if me["energy"] <= me["max_energy"] * 0.28:
+            self.recharging = True
+        elif me["energy"] >= me["max_energy"] * 0.65:
+            self.recharging = False
+        # In the air the same input jets upward. Save it for obstacle recovery.
+        sprint = me["grounded"] and (retreat or not me["in_zone"])
         action = {"tick": obs["tick"], "move": move, "jump": bool(detour and me["grounded"]),
-                  "boost": any(move) and me["energy"] > 28 and (retreat or not me["in_zone"] or detour),
+                  "boost": self.last_moving and not self.recharging and (sprint or detour),
                   "aim": [math.remainder(t * 0.75, math.tau), 0.0]}
         if obs["offer"] and obs["offer"]["choices"]:
             choices = obs["offer"]["choices"]
@@ -268,7 +294,15 @@ class Bot:
 
         target = min(exposed or enemies, key=target_cost, default=None)
         self.target_id = target["id"] if target else None
-        if not target and not hurt and me["in_zone"]:
+        # Damage bearings point toward the source even when it is outside our field of view.
+        for event in obs["events"]:
+            if (event["type"] == "damaged" and event.get("bearing") is not None
+                    and event["weapon"] in ("gun", "laser", "lightning", "mortar")
+                    and event.get("by") != me["id"]):
+                self.last_hit_bearing = event["bearing"]
+                self.watch_bearing_until = t + 1.2
+        watch_bearing = not exposed and t < self.watch_bearing_until
+        if not target and not watch_bearing and not hurt and me["in_zone"]:
             crates = [c for c in obs["crates"] if distance(pos, c["pos"]) < 90]
             if crates:
                 target = dict(min(crates, key=lambda c: distance(pos, c["pos"])), vel=[0, 0, 0],
@@ -282,9 +316,14 @@ class Bot:
             behind_cover = bool(enemies and not exposed)
             if not behind_cover:
                 action.update(engage(me, target, rotate or retreat))
-        else:
+        if watch_bearing:
+            action["aim"] = [self.last_hit_bearing, 0.0]
+        # The game's five-second sight memory can outlast a whole reload.
+        # Top up while the remembered opponent is behind a building.
+        if not target or (enemies and not exposed):
             gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
-            action["reload"] = bool(gun and gun["ammo"] < gun["stats"]["mag"] * 0.65)
+            action["reload"] = bool(gun and gun.get("reload", 0) <= 0
+                                    and gun["ammo"] < gun["stats"]["mag"] * 0.65)
         return action
 
 

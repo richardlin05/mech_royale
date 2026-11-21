@@ -44,6 +44,56 @@ def loot_goal(obs, center, radius):
     return min(options)[1] if options else None
 
 
+def early_loot(obs, center, radius):
+    """Allow a short detour only when we can still walk to safety before shrink starts."""
+    me, zone = obs["self"], obs["zone"]
+    remaining = zone["shrink_start"] - obs["t"]
+    if remaining <= 8 or not me["in_zone"]:
+        return None
+    pos = me["pos"]
+    options = []
+    items = list(obs["cubes"])
+    if None in me["weapons"]:
+        items.extend(p for p in obs["pickups"] if p["kind"] != "gun")
+    for item in items:
+        spot = item["pos"]
+        outward = distance(pos, spot)
+        if outward > 24 or abs(pos[2] - spot[2]) > 4:
+            continue
+        if distance(spot, zone["center"]) + 6 > zone["radius"]:
+            continue
+        inward = max(0, distance(spot, center) - radius)
+        # Allow twice the direct walking time for buildings, plus an eight-second buffer.
+        if 2 * (outward + inward) / me["stats"]["walk_speed"] + 8 < remaining:
+            options.append((outward, item["id"], spot))
+    return min(options)[2] if options else None
+
+
+def can_finish_drop(obs, enemies):
+    me = obs["self"]
+    for drop in obs.get("drops", []):
+        if drop["holder"] != me["id"] or drop["progress"] <= 0:
+            continue
+        if drop["lands_in"] > 0 or distance(me["pos"], drop["pos"]) >= drop["radius"]:
+            continue
+        left = max(0, drop["capture_s"] - drop["progress"])
+        if left > 1.5 or not me["in_zone"]:
+            continue
+        zone = obs["zone"]
+        shrink_from = max(obs["t"], zone["shrink_start"])
+        shrinking_for = max(0, obs["t"] + left - shrink_from)
+        fraction = min(1, shrinking_for / max(0.001, zone["shrink_end"] - shrink_from))
+        center = [a + fraction * (b - a) for a, b in zip(zone["center"], zone["next_center"])]
+        radius = zone["radius"] + fraction * (zone["next_radius"] - zone["radius"])
+        if distance(me["pos"], center) + 1 > radius:
+            continue
+        # Leave if an observed mech could contest the ring before the reward arrives.
+        clearance = drop["radius"] + left * me["stats"]["boost_speed"]
+        if all(distance(e["pos"], drop["pos"]) > clearance for e in enemies):
+            return True
+    return False
+
+
 def engage(me, target, mobile):
     """Choose a single aim and use the best ready, in-range slot for it."""
     pos = me["pos"]
@@ -142,6 +192,10 @@ class Bot:
         retreat = bool(enemies) and (hurt or crowded)
         rotate = not me["in_zone"] or distance(pos, center) > radius
         goal = center if rotate else loot_goal(obs, center, radius)
+        if rotate and not enemies:
+            detour_goal = early_loot(obs, center, radius)
+            if detour_goal is not None:
+                goal = detour_goal
         move = direction(pos, goal) if goal is not None else [0.0, 0.0]
         if enemies:
             toward = direction(pos, enemies[0]["pos"])
@@ -188,9 +242,12 @@ class Bot:
         detour = any(move) and t < self.detour_until
         if detour:
             move = [-self.side * move[1], self.side * move[0]]
+        if can_finish_drop(obs, enemies):
+            move = [0.0, 0.0]
+            detour = False
         self.last_moving = any(move)
         action = {"tick": obs["tick"], "move": move, "jump": bool(detour and me["grounded"]),
-                  "boost": me["energy"] > 28 and (retreat or not me["in_zone"] or detour),
+                  "boost": any(move) and me["energy"] > 28 and (retreat or not me["in_zone"] or detour),
                   "aim": [math.remainder(t * 0.75, math.tau), 0.0]}
         if obs["offer"] and obs["offer"]["choices"]:
             choices = obs["offer"]["choices"]
@@ -198,17 +255,18 @@ class Bot:
                 UPGRADES.index(choices[i]["id"]) if choices[i]["id"] in UPGRADES else len(UPGRADES)))
         if None in me["weapons"]:
             for p in obs["pickups"]:
-                if p["kind"] != "gun" and math.dist(pos, p["pos"]) <= self.pickup_radius:
+                if p["kind"] != "gun" and distance(pos, p["pos"]) <= self.pickup_radius and abs(pos[2] - p["pos"][2]) <= 4:
                     action["take"] = p["id"]
                     break
         # Commit to a reachable, damaged opponent to finish eliminations.
         gun_range = max((w["stats"].get("range", 0) for w in me["weapons"] if w), default=0)
+        exposed = [e for e in enemies if not self.arena or not self.arena.screened(pos, e["pos"])]
         def target_cost(enemy):
             dist = distance(pos, enemy["pos"])
             hp_fraction = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
             return (dist > gun_range, dist + 85 * hp_fraction - 20 * (enemy["id"] == self.target_id))
 
-        target = min(enemies, key=target_cost, default=None)
+        target = min(exposed or enemies, key=target_cost, default=None)
         self.target_id = target["id"] if target else None
         if not target and not hurt and me["in_zone"]:
             crates = [c for c in obs["crates"] if distance(pos, c["pos"]) < 90]
@@ -221,7 +279,7 @@ class Bot:
                     target = dict(min(drones, key=lambda e: distance(pos, e["pos"])), aim_height=self.npc_height)
         if target:
             action["aim"] = [math.atan2(target["pos"][1] - pos[1], target["pos"][0] - pos[0]), 0.0]
-            behind_cover = self.arena and retreat and self.arena.screened(pos, target["pos"])
+            behind_cover = bool(enemies and not exposed)
             if not behind_cover:
                 action.update(engage(me, target, rotate or retreat))
         else:

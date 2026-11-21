@@ -37,14 +37,23 @@ class Arena:
         self.ground = {}
         self.solids = {}
         self.blocked = set()
+        self.body_radius = 2.5
+        # Distances within one grid step of even a large mech's hull are
+        # computed at startup, so route expansion only needs a dictionary lookup.
+        self.clearance = {}
+        self.clearance_limit = 12.0
         for i in range(self.width):
             for j in range(self.height):
                 x, y = self.point((i, j))
                 col = round((x - terrain["minX"]) / terrain["step"])
                 row = round((y - terrain["minY"]) / terrain["step"])
                 self.ground[i, j] = elevation[row * terrain["nx"] + col] * terrain["scale"]
+                self.clearance[i, j] = min(x - self.x, y - self.y, bounds["maxX"] - x, bounds["maxY"] - y,
+                                           self.clearance_limit)
         for prism in world["prisms"]:
             ring = prism["ring"]
+            for boundary in (ring, *prism["holes"]):
+                self.add_wall_clearance(boundary, prism["base"], prism["top"])
             low = self.cell((min(ring[::2]), min(ring[1::2])))
             high = self.cell((max(ring[::2]), max(ring[1::2])))
             for i in range(low[0], high[0] + 1):
@@ -63,7 +72,30 @@ class Arena:
         self.path = []
         self.destination = None
         self.anchor = None
+        self.route_radius = self.body_radius
         self.replan_at = 0
+
+    def add_wall_clearance(self, ring, base, top):
+        """Find nearby grid points where the edge can collide with a walking mech."""
+        ax, ay = ring[-2:]
+        for bx, by in zip(ring[::2], ring[1::2]):
+            dx, dy = bx - ax, by - ay
+            length2 = dx * dx + dy * dy
+            if length2:
+                low = self.cell((min(ax, bx) - self.clearance_limit, min(ay, by) - self.clearance_limit))
+                high = self.cell((max(ax, bx) + self.clearance_limit, max(ay, by) + self.clearance_limit))
+                for i in range(max(0, low[0]), min(self.width, high[0] + 1)):
+                    for j in range(max(0, low[1]), min(self.height, high[1] + 1)):
+                        cell = i, j
+                        ground = self.ground[cell]
+                        if top <= ground + 1.2 or base >= ground + 9:
+                            continue
+                        x, y = self.point(cell)
+                        fraction = max(0, min(1, ((x - ax) * dx + (y - ay) * dy) / length2))
+                        gap = math.hypot(x - ax - fraction * dx, y - ay - fraction * dy)
+                        if gap < self.clearance[cell]:
+                            self.clearance[cell] = gap
+            ax, ay = bx, by
 
     def cell(self, pos):
         return (round((pos[0] - self.x) / self.step), round((pos[1] - self.y) / self.step))
@@ -72,7 +104,7 @@ class Arena:
         return self.x + cell[0] * self.step, self.y + cell[1] * self.step
 
     def open(self, cell):
-        return cell in self.ground and cell not in self.blocked
+        return cell not in self.blocked and self.clearance.get(cell, -1) >= min(self.body_radius, self.clearance_limit)
 
     def screened(self, pos, enemy):
         length = math.dist(pos[:2], enemy[:2])
@@ -108,7 +140,7 @@ class Arena:
 
     def waypoint(self, pos, goal, now):
         start, requested = self.cell(pos), self.cell(goal)
-        if not self.open(start):
+        if start not in self.ground or start in self.blocked:
             return goal  # The ground grid does not describe travel on a roof.
         end = requested
         if not self.open(end):
@@ -121,7 +153,8 @@ class Arena:
             return goal if end == requested else self.point(end)
 
         off_path = start != self.anchor and (not self.path or start != self.path[-1])
-        if self.destination != end or now >= self.replan_at or off_path:
+        if self.destination != end or now >= self.replan_at or off_path or self.route_radius != self.body_radius:
+            self.route_radius = self.body_radius
             self.destination, self.replan_at = end, now + 1.5
             self.anchor = start
             self.path = self.route(start, end)

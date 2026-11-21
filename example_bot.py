@@ -2,6 +2,7 @@
 import math
 
 import mechfight as mf
+from arena_nav import Arena
 
 
 UPGRADES = ("armor", "nanites", "servos", "plating", "reactor", "gun_damage", "gun_rate")
@@ -21,18 +22,25 @@ def direction(a, b):
 def loot_goal(obs, center, radius):
     me = obs["self"]
     pos = me["pos"]
-    items = [(c, 0) for c in obs["cubes"]]
+    items = [(c, -8) for c in obs["cubes"]]
     if None in me["weapons"]:
         items.extend((p, 5) for p in obs["pickups"] if p["kind"] != "gun")
     options = [(distance(pos, item["pos"]) + penalty, item["pos"])
                for item, penalty in items
                if abs(item["pos"][2] - pos[2]) <= 4
                and distance(item["pos"], center) <= radius
-               and distance(item["pos"], pos) <= 45]
+               and distance(item["pos"], pos) <= 105]
     for drop in obs.get("drops", []):
-        if (drop["lands_in"] == 0 and drop["holder"] in (None, me["id"])
-                and distance(pos, drop["pos"]) < 45 and distance(drop["pos"], center) <= radius):
-            options.append((distance(pos, drop["pos"]) - 12, drop["pos"]))
+        travel = distance(pos, drop["pos"])
+        arrival = travel / max(1, me["stats"]["walk_speed"])
+        if (drop["lands_in"] <= arrival + 3 and drop["holder"] in (None, me["id"])
+                and travel < 150 and distance(drop["pos"], center) <= radius):
+            options.append((travel * 0.55 - 32, drop["pos"]))
+    if not options:
+        for crate in obs["crates"]:
+            if distance(pos, crate["pos"]) < 90 and abs(crate["pos"][2] - pos[2]) < 5:
+                if distance(crate["pos"], center) <= radius:
+                    options.append((distance(pos, crate["pos"]), crate["pos"]))
     return min(options)[1] if options else None
 
 
@@ -41,12 +49,12 @@ def engage(me, target, mobile):
     pos = me["pos"]
     best = None
     for slot, weapon in enumerate(me["weapons"]):
-        if not weapon or weapon["cooldown"] > 0:
+        if not weapon or (weapon["kind"] != "gun" and weapon["cooldown"] > 0):
             continue
         stats, kind = weapon["stats"], weapon["kind"]
         dest = target["pos"]
         dx, dy = dest[0] - pos[0], dest[1] - pos[1]
-        dz = dest[2] + 4.5 - pos[2] - me["stats"]["muzzle_height"]
+        dz = dest[2] + target.get("aim_height", 4.5) - pos[2] - me["stats"]["muzzle_height"]
         horizontal = math.hypot(dx, dy)
         if kind == "mortar":
             if horizontal < stats["splash_radius"] * 2:
@@ -97,7 +105,7 @@ def engage(me, target, mobile):
         flight = math.hypot(dx, dy) / other["stats"]["speed"]
         dx += target["vel"][0] * flight
         dy += target["vel"][1] * flight
-        gun_pitch = math.atan2(dz + 4.5 - me["stats"]["muzzle_height"], math.hypot(dx, dy))
+        gun_pitch = math.atan2(dz + target.get("aim_height", 4.5) - me["stats"]["muzzle_height"], math.hypot(dx, dy))
         fire[i] = (math.hypot(dx, dy) <= other["stats"]["range"]
                    and abs(math.remainder(math.atan2(dy, dx) - me["aim"][0], math.tau)) < 0.12
                    and abs(gun_pitch - me["aim"][1]) < 0.12)
@@ -110,6 +118,14 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         self.pickup_radius = hello["config"]["loot"]["pickup_radius"]
         self.side = 1 if hello["slot"] % 2 else -1
+        try:
+            self.arena = Arena(hello["map"]["dir"])
+        except (OSError, ValueError, KeyError, IndexError):
+            self.arena = None
+        self.crate_height = hello["config"]["crates"]["height"] / 2
+        self.npc_height = hello["config"]["npc"]["height"] / 2
+        self.cover_goal = None
+        self.next_cover_search = 0
         self.target_id = None
         self.sample = None
         self.detour_until = -1
@@ -151,6 +167,19 @@ class Bot:
             move = direction(pos, [center[0] + orbit * math.cos(angle),
                                    center[1] + orbit * math.sin(angle)])
 
+        # Use physical cover to buy time for regeneration under pressure.
+        if self.arena and retreat and not rotate:
+            if t >= self.next_cover_search:
+                self.cover_goal = self.arena.cover(pos, enemies, center, radius)
+                self.next_cover_search = t + 1.0
+            if self.cover_goal:
+                goal = self.cover_goal
+        else:
+            self.cover_goal = None
+        # Commit to the next waypoint for travel. Keep free strafing in a duel.
+        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal):
+            waypoint = self.arena.waypoint(pos, goal, t)
+            move = direction(pos, waypoint)
         if self.sample is None or t - self.sample[0] >= 0.8:
             if self.sample and self.last_moving and any(move) and distance(pos, self.sample[1]) < 1.2:
                 self.detour_until = t + 0.75
@@ -181,13 +210,19 @@ class Bot:
 
         target = min(enemies, key=target_cost, default=None)
         self.target_id = target["id"] if target else None
-        if not target and not hurt and not rotate:
-            crates = [c for c in obs["crates"] if distance(pos, c["pos"]) < 40]
+        if not target and not hurt and me["in_zone"]:
+            crates = [c for c in obs["crates"] if distance(pos, c["pos"]) < 90]
             if crates:
-                target = dict(min(crates, key=lambda c: distance(pos, c["pos"])), vel=[0, 0, 0])
+                target = dict(min(crates, key=lambda c: distance(pos, c["pos"])), vel=[0, 0, 0],
+                              aim_height=self.crate_height)
+            else:
+                drones = [e for e in obs["mechs"] if e["kind"] == "npc" and distance(pos, e["pos"]) < 70]
+                if drones:
+                    target = dict(min(drones, key=lambda e: distance(pos, e["pos"])), aim_height=self.npc_height)
         if target:
             action["aim"] = [math.atan2(target["pos"][1] - pos[1], target["pos"][0] - pos[0]), 0.0]
-            if not (hurt and retreat and distance(pos, target["pos"]) > 45):
+            behind_cover = self.arena and retreat and self.arena.screened(pos, target["pos"])
+            if not behind_cover:
                 action.update(engage(me, target, rotate or retreat))
         else:
             gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)

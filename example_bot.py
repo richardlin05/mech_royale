@@ -88,6 +88,19 @@ def engage(me, target, mobile):
         fire[slot] = weapon.get("charge", 0) < weapon["stats"]["charge"] or not aligned
     else:
         fire[slot] = aligned
+
+    # Both arms can fire together. Use the gun when the shared aim also fits it.
+    for i, other in enumerate(me["weapons"]):
+        if i == slot or not other or other["kind"] != "gun" or other.get("ammo", 0) <= 0:
+            continue
+        dx, dy, dz = [target["pos"][j] - pos[j] for j in range(3)]
+        flight = math.hypot(dx, dy) / other["stats"]["speed"]
+        dx += target["vel"][0] * flight
+        dy += target["vel"][1] * flight
+        gun_pitch = math.atan2(dz + 4.5 - me["stats"]["muzzle_height"], math.hypot(dx, dy))
+        fire[i] = (math.hypot(dx, dy) <= other["stats"]["range"]
+                   and abs(math.remainder(math.atan2(dy, dx) - me["aim"][0], math.tau)) < 0.12
+                   and abs(gun_pitch - me["aim"][1]) < 0.12)
     return {"aim": [yaw, pitch], "fire": fire}
 
 
@@ -97,6 +110,7 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         self.pickup_radius = hello["config"]["loot"]["pickup_radius"]
         self.side = 1 if hello["slot"] % 2 else -1
+        self.target_id = None
         self.sample = None
         self.detour_until = -1
         self.last_moving = False
@@ -107,23 +121,35 @@ class Bot:
         radius = max(0, zone["next_radius"] - min(15, zone["next_radius"] * 0.2))
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
-        close = [e for e in enemies if distance(pos, e["pos"]) < 95]
         hurt = me["hp"] < 0.65 * me["max_hp"]
-        retreat = bool(close) and (hurt or len(close) >= 2)
+        crowded = sum(distance(pos, e["pos"]) < 110 for e in enemies) >= 2
+        retreat = bool(enemies) and (hurt or crowded)
         rotate = not me["in_zone"] or distance(pos, center) > radius
-        goal = center if rotate else None
-        if not rotate and not enemies:
-            goal = loot_goal(obs, center, radius)
+        goal = center if rotate else loot_goal(obs, center, radius)
         move = direction(pos, goal) if goal is not None else [0.0, 0.0]
-        if close and not rotate:
-            toward = direction(pos, close[0]["pos"])
-            side = self.side * (1 if int(t / 2) % 2 else -1)
+        if enemies:
+            toward = direction(pos, enemies[0]["pos"])
+            side = self.side
+            if not rotate and int(t / 3) % 2:
+                side *= -1
             lateral = [-side * toward[1], side * toward[0]]
-            away = 1.4 if retreat else 0.35
-            move = direction((0, 0), [lateral[i] - away * toward[i] for i in range(2)])
-            projected = [pos[i] + move[i] * 10 for i in range(2)]
-            if distance(projected, center) > radius:
-                move = direction(pos, center)
+            if rotate:
+                # Choose the tangent that still makes progress toward safety.
+                if sum(lateral[i] * move[i] for i in range(2)) < 0:
+                    lateral = [-n for n in lateral]
+                move = direction((0, 0), [move[i] + 0.6 * lateral[i] for i in range(2)])
+            else:
+                away = 1.4 if retreat else 0.25
+                move = direction((0, 0), [lateral[i] - away * toward[i] for i in range(2)])
+                if distance([pos[i] + 10 * move[i] for i in range(2)], center) > radius:
+                    inward = direction(pos, center)
+                    move = direction((0, 0), [inward[i] + 0.45 * lateral[i] for i in range(2)])
+        elif goal is None and radius > 8:
+            # Search for resources along a circuit inside the next circle.
+            orbit = min(radius * 0.7, 85)
+            angle = math.atan2(pos[1] - center[1], pos[0] - center[0]) + self.side * 0.5
+            move = direction(pos, [center[0] + orbit * math.cos(angle),
+                                   center[1] + orbit * math.sin(angle)])
 
         if self.sample is None or t - self.sample[0] >= 0.8:
             if self.sample and self.last_moving and any(move) and distance(pos, self.sample[1]) < 1.2:
@@ -146,7 +172,15 @@ class Bot:
                 if p["kind"] != "gun" and math.dist(pos, p["pos"]) <= self.pickup_radius:
                     action["take"] = p["id"]
                     break
-        target = enemies[0] if enemies else None
+        # Commit to a reachable, damaged opponent to finish eliminations.
+        gun_range = max((w["stats"].get("range", 0) for w in me["weapons"] if w), default=0)
+        def target_cost(enemy):
+            dist = distance(pos, enemy["pos"])
+            hp_fraction = enemy.get("hp", 1400) / max(1, enemy.get("max_hp", 1400))
+            return (dist > gun_range, dist + 85 * hp_fraction - 20 * (enemy["id"] == self.target_id))
+
+        target = min(enemies, key=target_cost, default=None)
+        self.target_id = target["id"] if target else None
         if not target and not hurt and not rotate:
             crates = [c for c in obs["crates"] if distance(pos, c["pos"]) < 40]
             if crates:

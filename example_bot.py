@@ -4,8 +4,9 @@ import math
 import mechfight as mf
 from arena_nav import Arena
 from awareness import Awareness
+from duel_spacing import duel_advance
 from equipment import Equipment
-from resource_policy import ResourceMemory, drop_cost
+from resource_policy import FirstLoadout, ResourceMemory, drop_cost
 from zone_policy import ZonePolicy, forecast, needs_sprint
 
 
@@ -266,6 +267,7 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         self.equipment = Equipment(hello["config"])
         self.resources = ResourceMemory(hello["config"])
+        self.first_loadout = FirstLoadout()
         self.zone_policy = ZonePolicy()
         self.side = 1 if hello["slot"] % 2 else -1
         try:
@@ -304,6 +306,9 @@ class Bot:
             detour_goal = early_loot(resource_obs, center, radius, self.arena)
             if detour_goal is not None:
                 goal = detour_goal
+        first_weapon = self.first_loadout.goal(obs, enemies, self.arena, urgent)
+        if first_weapon is not None:
+            goal = first_weapon
         move = direction(pos, goal) if goal is not None else [0.0, 0.0]
         if enemies:
             toward = direction(pos, enemies[0]["pos"])
@@ -336,13 +341,18 @@ class Bot:
         else:
             self.cover_goal = None
         # Commit to the next waypoint for travel. Keep free strafing in a duel.
-        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal):
+        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal or first_weapon is not None):
             waypoint = self.arena.waypoint(pos, goal, t)
             move = direction(pos, waypoint)
-        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent:
+        duel_sprint = False
+        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent and first_weapon is None:
             reward = duel_loot_goal(resource_obs, enemies[0], self.arena)
             if reward is not None:
                 move = direction(pos, reward)
+            elif not rotate and not retreat:
+                advance = duel_advance(me, enemies[0], side, center, radius, self.arena)
+                if advance is not None:
+                    move, duel_sprint = advance
         if self.sample is None or t - self.sample[0] >= 0.8:
             if self.sample and self.last_moving and any(move) and distance(pos, self.sample[1]) < 1.2:
                 self.detour_until = t + 0.75
@@ -362,7 +372,7 @@ class Bot:
         elif me["energy"] >= me["max_energy"] * 0.65:
             self.recharging = False
         # In the air the same input jets upward. Save it for obstacle recovery.
-        sprint = me["grounded"] and (retreat or storm_urgent)
+        sprint = me["grounded"] and (retreat or storm_urgent or duel_sprint)
         action = {"tick": obs["tick"], "move": move, "jump": bool(detour and me["grounded"]),
                   "boost": self.last_moving and not self.recharging and (sprint or detour),
                   "aim": [math.remainder(t * 0.75, math.tau), 0.0]}

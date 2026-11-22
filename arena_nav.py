@@ -211,6 +211,14 @@ class Arena:
         start, requested = self.cell(pos), self.cell(goal)
         if start not in self.ground or start in self.blocked:
             return goal  # The ground grid does not describe travel on a roof.
+        if not self.open(start):
+            # The actor's actual position can legally clear a wall even when
+            # the nearest grid center does not. Its graph edges all inherit
+            # that center's inadequate clearance. Step back onto the graph.
+            # Preserve slope and wall-corner checks from the original graph.
+            points = (self.point(cell) for cell, _, _ in self.walk_edges.get(start, ())
+                      if self.open(cell))
+            return min(points, key=lambda p: math.dist(pos[:2], p), default=pos)
         end = requested
         if not self.open(end):
             nearby = ((end[0] + dx, end[1] + dy) for dx in range(-4, 5) for dy in range(-4, 5))

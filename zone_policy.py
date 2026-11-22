@@ -72,7 +72,11 @@ class ZonePolicy:
                 and math.dist(self.patrol_goal, center) < radius
                 and math.dist(self.patrol_goal, pos) > 4):
             return self.patrol_goal
-        orbit = min(0.7 * radius, 85)
+        orbit = 0.7 * radius
+        if orbit > 85:
+            # Large circles leave room to search on the side we already occupy.
+            # Avoid crossing the center on a quiet patrol just after zone entry.
+            orbit = min(0.85 * radius, max(0.5 * radius, math.dist(pos, center)))
         angle = math.atan2(pos[1] - center[1], pos[0] - center[0])
         for offset in (0.55, 0.9, 1.3, -0.55, -0.9, math.pi):
             x = center[0] + orbit * math.cos(angle + side * offset)

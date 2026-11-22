@@ -168,14 +168,19 @@ class Arena:
         return False
 
     def cover(self, pos, enemies, center, radius):
-        enemies = enemies[:3]
         if not enemies:
             return None
-        if math.dist(pos[:2], center) <= radius and all(self.screened(pos, e["pos"]) for e in enemies):
-            return pos
+        nearby = enemies[:3]
+        exposed = None
+        if math.dist(pos[:2], center) <= radius and all(self.screened(pos, e["pos"]) for e in nearby):
+            # The nearest three can all be behind the same building while a
+            # fourth has an open line. Standing still here would prevent recovery.
+            exposed = next((e for e in enemies[3:] if not self.screened(pos, e["pos"])), None)
+            if exposed is None:
+                return pos
         start = self.cell(pos)
         if start not in self.walk_edges:
-            return None
+            return pos if exposed is not None else None
         # Explore in walking-distance order. A wall can make a spot ten meters
         # away take much longer to reach than a nearby doorway on the same side.
         required = min(self.body_radius, self.clearance_limit)
@@ -185,7 +190,7 @@ class Arena:
         while queue:
             steps, cell = heapq.heappop(queue)
             meters = steps * self.step
-            if meters > 40 or meters - 40 * len(enemies) >= best_cost:
+            if meters > 40 or meters - 40 * len(nearby) >= best_cost:
                 break
             if steps != paths[cell]:
                 continue
@@ -196,16 +201,24 @@ class Arena:
             candidate = meters <= 12 or (dx % 2 == 0 and dy % 2 == 0)
             if cell != start and candidate and math.hypot(x - center[0], y - center[1]) <= radius:
                 spot = x, y, self.ground[cell]
-                hidden = sum(self.screened(spot, e["pos"]) for e in enemies)
-                cost = meters - 40 * hidden
-                if hidden and cost < best_cost:
-                    best, best_cost = spot, cost
+                if exposed is not None:
+                    # Move from partial cover only for a reachable cell that
+                    # screens everyone. The queue checks shortest walks first.
+                    if self.screened(spot, exposed["pos"]) and all(
+                        self.screened(spot, e["pos"]) for e in enemies if e is not exposed
+                    ):
+                        return spot
+                else:
+                    hidden = sum(self.screened(spot, e["pos"]) for e in nearby)
+                    cost = meters - 40 * hidden
+                    if hidden and cost < best_cost:
+                        best, best_cost = spot, cost
             for neighbor, length, gap in self.walk_edges[cell]:
                 new = steps + length
                 if gap >= required and new < paths.get(neighbor, math.inf):
                     paths[neighbor] = new
                     heapq.heappush(queue, (new, neighbor))
-        return best
+        return pos if exposed is not None else best
 
     def waypoint(self, pos, goal, now):
         start, requested = self.cell(pos), self.cell(goal)

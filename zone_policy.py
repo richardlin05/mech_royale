@@ -33,6 +33,7 @@ class ZonePolicy:
     def __init__(self):
         self.patrol_goal = None
         self.patrol_until = 0
+        self.patrol_history = []
 
     @staticmethod
     def entry(obs, radius, arena):
@@ -72,15 +73,28 @@ class ZonePolicy:
                 and math.dist(self.patrol_goal, center) < radius
                 and math.dist(self.patrol_goal, pos) > 4):
             return self.patrol_goal
-        orbit = min(0.7 * radius, 85)
+        # Vary search depth inside large circles so revisiting the same ring
+        # is less attractive than crossing a fresh patch of the loot field.
         angle = math.atan2(pos[1] - center[1], pos[0] - center[0])
-        for offset in (0.55, 0.9, 1.3, -0.55, -0.9, math.pi):
-            x = center[0] + orbit * math.cos(angle + side * offset)
-            y = center[1] + orbit * math.sin(angle + side * offset)
-            if arena and not arena.open(arena.cell((x, y))):
-                continue
-            self.patrol_goal = (x, y)
-            self.patrol_until = now + 8
-            return self.patrol_goal
+        best, best_value = None, -math.inf
+        for orbit in (min(0.75 * radius, 165), min(0.42 * radius, 90), min(0.2 * radius, 45)):
+            for offset in (0.55, 1.0, -0.65, 1.8, -1.5, math.pi):
+                point = (center[0] + orbit * math.cos(angle + side * offset),
+                         center[1] + orbit * math.sin(angle + side * offset))
+                if arena and not arena.open(arena.cell(point)):
+                    continue
+                travel = math.dist(pos, point)
+                if travel < min(8, radius * 0.3):
+                    continue
+                novelty = min((math.dist(point, old) for old in self.patrol_history), default=100)
+                # Prefer unexplored destinations within one manageable walking leg.
+                score = min(novelty, 100) - 0.7 * abs(travel - min(75, radius * 0.7))
+                if score > best_value:
+                    best, best_value = point, score
+        if best:
+            self.patrol_goal = best
+            self.patrol_until = now + max(8, min(18, 2 + math.dist(pos, best) / obs["self"]["stats"]["walk_speed"]))
+            self.patrol_history = (self.patrol_history + [best])[-8:]
+            return best
         self.patrol_goal = None
         return center

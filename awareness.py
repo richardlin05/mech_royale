@@ -2,6 +2,33 @@
 import math
 
 
+def best_crate(me, crates, arena=None):
+    """Choose the earliest collectible cube, allowing travel and opening to overlap."""
+    pos = me["pos"]
+    gun = next((w for w in me.get("weapons", []) if w and w["kind"] == "gun"), None)
+    speed = me.get("stats", {}).get("walk_speed", 11.7)
+    options = []
+    for c in crates:
+        spot = c["pos"]
+        dist = math.dist(pos[:2], spot[:2])
+        if dist >= 90:
+            continue
+        if abs(pos[2] - spot[2]) > 4:
+            if not arena or any(not arena.open(arena.cell(p)) or abs(p[2] - arena.ground[arena.cell(p)]) > 2.5
+                                for p in (pos, spot)):
+                continue
+        opened = 0
+        if gun:
+            stats = gun["stats"]
+            rounds = max(1, math.ceil(c.get("hp", 300) / stats["damage"]))
+            remaining_reload = gun.get("reload", 0)
+            available = stats["mag"] if remaining_reload > 0 else gun["ammo"]
+            reloads = math.ceil(max(0, rounds - available) / stats["mag"])
+            opened = remaining_reload + (rounds - 1) * stats["cooldown"] + reloads * stats["reload"]
+        options.append((max(dist / speed, opened), dist, c["id"], c))
+    return min(options, key=lambda o: o[:3])[-1] if options else None
+
+
 class Awareness:
     def __init__(self, config):
         self.npc_range = config["npc"]["aggro_range"]
@@ -65,9 +92,8 @@ class Awareness:
             return dict(drone, aim_height=self.npc_height)
         if self.recovering:
             return None
-        crates = [c for c in obs["crates"] if math.dist(pos[:2], c["pos"][:2]) < 90]
-        if crates:
-            crate = min(crates, key=lambda c: math.dist(pos, c["pos"]))
+        crate = best_crate(me, obs["crates"], arena)
+        if crate is not None:
             return dict(crate, vel=[0, 0, 0], aim_height=self.crate_height)
         if drones:
             return dict(min(drones, key=lambda a: math.dist(pos, a["pos"])), aim_height=self.npc_height)

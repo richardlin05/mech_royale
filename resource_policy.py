@@ -7,6 +7,8 @@ class ResourceMemory:
     def __init__(self, config):
         self.seen = {"cubes": {}, "pickups": {}}
         self.thresholds = config["cubes"]["upgrade_thresholds"]
+        self.stat_cap = config["cubes"]["stat_cap"]
+        self.cube_radius = config["cubes"]["pickup_radius"]
 
     def route_view(self, obs):
         """Remember static items briefly while preserving the raw observation for interaction."""
@@ -38,13 +40,42 @@ class ResourceMemory:
         counts = [Counter(tile(c["pos"], offset) for c in cubes) for offset in (0, 3)]
         owned = obs["self"]["cubes"]
         until_offer = next((n - owned for n in self.thresholds if n > owned), math.inf)
+        # Cubes disappear on contact. Bypass races where a nearby rival is
+        # already inside the collection area or is visibly closing within a second.
+        rivals = [actor for actor in obs.get("mechs", ()) if actor["kind"] == "mech"]
         ranked = []
         for cube in cubes:
+            spot = cube["pos"]
+            travel = math.dist(pos[:2], spot[:2])
+            if travel > self.cube_radius and self.claimed_by_rival(spot, rivals, travel):
+                continue
             size = max(counts[i][tile(cube["pos"], offset)] for i, offset in enumerate((0, 3)))
+            # Beyond the health and damage cap, individual cubes enlarge the mech.
+            # Still pursue a pile that buys an upgrade, and take incidental cubes.
+            if owned >= self.stat_cap and size < until_offer and travel > 12:
+                continue
             bonus = 5 * min(4, size - 1) + (7 if size >= until_offer else 0)
             ranked.append(dict(cube, route_bonus=bonus))
         view["cubes"] = ranked
         return view
+
+    def claimed_by_rival(self, spot, rivals, our_distance):
+        for rival in rivals:
+            pos = rival["pos"]
+            if abs(pos[2] - spot[2]) > 4:
+                continue
+            dx, dy = spot[0] - pos[0], spot[1] - pos[1]
+            distance = math.hypot(dx, dy)
+            if distance >= our_distance - self.cube_radius:
+                continue
+            if distance <= self.cube_radius:
+                return True
+            if distance <= 12:
+                vx, vy = rival["vel"][:2]
+                closing = (dx * vx + dy * vy) / distance
+                if closing >= distance - self.cube_radius:
+                    return True
+        return False
 
 
 def drop_cost(me, drop, travel, speed):
@@ -61,7 +92,8 @@ def drop_cost(me, drop, travel, speed):
 
 class FirstLoadout:
     """Remember a reachable first secondary during the opening search."""
-    def __init__(self):
+    def __init__(self, pickup_radius=4):
+        self.pickup_radius = pickup_radius
         self.item = None
         self.seen_at = 0
         self.best_distance = math.inf
@@ -71,7 +103,6 @@ class FirstLoadout:
     def goal(self, obs, enemies, arena, urgent):
         me, zone, now = obs["self"], obs["zone"], obs["t"]
         if (None not in me["weapons"] or urgent or not me["in_zone"] or
-                now >= zone["shrink_start"] or zone["radius"] < 120 or
                 me["hp"] < 0.7 * me["max_hp"] or len(enemies) > 1):
             self.item = None
             return None
@@ -101,7 +132,7 @@ class FirstLoadout:
         options = dict(visible)
         if self.item:
             options.setdefault(self.item["id"], self.item)
-        selected, best_cost = None, math.inf
+        selected, destination, best_cost = None, None, math.inf
         for item in options.values():
             spot = item["pos"]
             if now < self.abandoned.get(item["id"], -1):
@@ -109,25 +140,49 @@ class FirstLoadout:
             travel = math.dist(pos[:2], spot[:2])
             if travel > 155 or math.dist(spot[:2], zone["center"]) + 6 >= zone["radius"]:
                 continue
-            if arena:
-                cell = arena.cell(spot)
-                if not arena.open(cell) or abs(spot[2] - arena.ground[cell]) > 4:
-                    continue
-            elif abs(spot[2] - pos[2]) > 4:
+            destination_spot = self.approach_point(pos, spot, arena)
+            if destination_spot is None:
                 continue
             if any(math.dist(spot[:2], e["pos"][:2]) < min(90, 0.85 * separation) for e in enemies):
                 continue
             to_safety = max(0, math.dist(spot[:2], zone["next_center"]) - zone["next_radius"] + 10)
-            if now + 1.7 * (travel + to_safety) / me["stats"]["walk_speed"] + 5 > zone["shrink_start"]:
+            walk_speed = me["stats"]["walk_speed"]
+            enough_time = now + 1.7 * (travel + to_safety) / walk_speed + 5 <= zone["shrink_start"]
+            # The next circle is contained in the current one. Short trips deep
+            # inside it remain available during shrink, even in a small arena.
+            safe_trip = (travel < 5 * walk_speed and to_safety == 0
+                         and math.dist(pos[:2], zone["next_center"]) + 10 < zone["next_radius"])
+            if not enough_time and not safe_trip:
                 continue
             # An early long-range secondary is worth a small extra walk.
             cost = travel + 0.6 * to_safety + (18 if item["kind"] == "lightning" else 0)
             if self.item and self.item["id"] == item["id"]:
                 cost -= 12
             if cost < best_cost:
-                selected, best_cost = item, cost
+                selected, destination, best_cost = item, destination_spot, cost
         if selected and (not self.item or selected["id"] != self.item["id"]):
             self.progress_at = self.seen_at = now
             self.best_distance = math.dist(pos[:2], selected["pos"][:2])
         self.item = selected
-        return selected["pos"] if selected else None
+        return destination
+
+    def approach_point(self, pos, spot, arena):
+        if not arena:
+            return spot if abs(spot[2] - pos[2]) <= 4 else None
+        cell = arena.cell(spot)
+        if arena.open(cell) and abs(spot[2] - arena.ground[cell]) <= 4:
+            return spot
+        # A floor item against a building may snap to a blocked cell. The game
+        # permits a take anywhere inside the pickup cylinder, including the next cell.
+        candidates = []
+        i, j = cell
+        limit = math.ceil(self.pickup_radius / arena.step)
+        for ix in range(i - limit, i + limit + 1):
+            for iy in range(j - limit, j + limit + 1):
+                here = ix, iy
+                if not arena.open(here) or abs(spot[2] - arena.ground[here]) > 4:
+                    continue
+                xy = arena.point(here)
+                if math.dist(xy, spot[:2]) <= self.pickup_radius:
+                    candidates.append([*xy, arena.ground[here]])
+        return min(candidates, key=lambda target: math.dist(target[:2], pos[:2]), default=None)

@@ -3,8 +3,9 @@ import math
 
 import mechfight as mf
 from arena_nav import Arena
-from awareness import Awareness
-from duel_spacing import duel_advance
+from awareness import Awareness, best_crate
+from combat_choices import charged_damage, finish_priority, reload_window
+from duel_spacing import duel_advance, isolated_opponent
 from equipment import Equipment
 from resource_policy import FirstLoadout, ResourceMemory, drop_cost
 from zone_policy import ZonePolicy, forecast, needs_sprint
@@ -54,10 +55,10 @@ def loot_goal(obs, center, radius, arena=None):
                 and travel < 150 and distance(drop["pos"], center) <= radius):
             options.append((drop_cost(me, drop, travel, me["stats"]["walk_speed"]), drop["pos"]))
     if not options:
-        for crate in obs["crates"]:
-            if distance(pos, crate["pos"]) < 90 and reachable_loot_level(pos, crate["pos"], arena):
-                if distance(crate["pos"], center) <= radius:
-                    options.append((distance(pos, crate["pos"]), crate["pos"]))
+        candidates = [c for c in obs["crates"] if distance(c["pos"], center) <= radius]
+        crate = best_crate(me, candidates, arena)
+        if crate is not None:
+            return crate["pos"]
     return min(options)[1] if options else None
 
 
@@ -183,7 +184,7 @@ def can_finish_drop(obs, enemies):
     return False
 
 
-def engage(me, target, mobile):
+def engage(me, target, mobile, multiplier=1.0):
     """Choose a single aim and use the best ready, in-range slot for it."""
     pos = me["pos"]
     best = None
@@ -234,11 +235,8 @@ def engage(me, target, mobile):
     if weapon["kind"] == "laser":
         stats = weapon["stats"]
         charged = weapon.get("charge", 0)
-        # The game publishes target HP. Release early only if the accumulated
-        # charge suffices even with a 25% discount for armor.
-        charged_damage = stats["damage"] * min(1, charged / stats["charge"])
-        sufficient = (charged >= stats["min_charge"]
-                      and target.get("hp", math.inf) <= charged_damage * 0.75)
+        sufficient = (charged >= stats["min_charge"] and
+                      target.get("hp", math.inf) <= charged_damage(weapon, target, multiplier))
         fire[slot] = not (aligned and (charged >= stats["charge"] or sufficient))
     elif weapon["kind"] == "lightning":
         # This slot uses a yaw cone and ignores pitch under mechfight/1.
@@ -255,9 +253,15 @@ def engage(me, target, mobile):
         dx += target["vel"][0] * flight
         dy += target["vel"][1] * flight
         gun_pitch = math.atan2(dz + target.get("aim_height", 4.5) - me["stats"]["muzzle_height"], math.hypot(dx, dy))
-        fire[i] = (math.hypot(dx, dy) <= other["stats"]["range"]
-                   and abs(math.remainder(math.atan2(dy, dx) - me["aim"][0], math.tau)) < 0.12
+        gun_yaw = math.atan2(dy, dx)
+        in_range = math.hypot(dx, dy) <= other["stats"]["range"]
+        fire[i] = (in_range and abs(math.remainder(gun_yaw - me["aim"][0], math.tau)) < 0.12
                    and abs(gun_pitch - me["aim"][1]) < 0.12)
+        # Lightning tests a broad yaw cone and ignores pitch. A gun aim that
+        # stays within that cone can serve both slots.
+        if (in_range and weapon["kind"] == "lightning" and other.get("reload", 0) == 0
+                and abs(math.remainder(gun_yaw - yaw, math.tau)) < math.radians(weapon["stats"]["cone_deg"])):
+            yaw, pitch = gun_yaw, gun_pitch
     return {"aim": [yaw, pitch], "fire": fire}
 
 
@@ -267,7 +271,7 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         self.equipment = Equipment(hello["config"])
         self.resources = ResourceMemory(hello["config"])
-        self.first_loadout = FirstLoadout()
+        self.first_loadout = FirstLoadout(hello["config"]["loot"]["pickup_radius"])
         self.zone_policy = ZonePolicy()
         self.side = 1 if hello["slot"] % 2 else -1
         try:
@@ -275,6 +279,8 @@ class Bot:
         except (OSError, ValueError, KeyError, IndexError):
             self.arena = None
         self.awareness = Awareness(hello["config"])
+        self.enemy_arc_range = hello["config"]["weapons"]["lightning"]["range"]
+        self.cube_rules = hello["config"]["cubes"]
         self.cover_goal = None
         self.next_cover_search = 0
         self.target_id = None
@@ -289,6 +295,7 @@ class Bot:
         pos, center = me["pos"], zone["next_center"]
         if self.arena is not None:
             self.arena.body_radius = me["stats"]["radius"]
+            self.arena.body_height = me["stats"]["height"]
         radius = max(0, zone["next_radius"] - min(15, zone["next_radius"] * 0.2))
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
@@ -345,12 +352,14 @@ class Bot:
             waypoint = self.arena.waypoint(pos, goal, t)
             move = direction(pos, waypoint)
         duel_sprint = False
-        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent and first_weapon is None:
-            reward = duel_loot_goal(resource_obs, enemies[0], self.arena)
+        if enemies and self.cover_goal is None and not storm_urgent and first_weapon is None:
+            opponent = isolated_opponent(enemies, pos, self.arena)
+            reward = duel_loot_goal(resource_obs, enemies[0], self.arena) if len(enemies) == 1 else None
             if reward is not None:
                 move = direction(pos, reward)
-            elif not rotate and not retreat:
-                advance = duel_advance(me, enemies[0], side, center, radius, self.arena)
+            elif opponent is not None and not rotate:
+                advance = duel_advance(me, opponent, side, center, radius, self.arena,
+                                       obs["alive"], self.enemy_arc_range)
                 if advance is not None:
                     move, duel_sprint = advance
         if self.sample is None or t - self.sample[0] >= 0.8:
@@ -385,16 +394,14 @@ class Bot:
         gun_range = max((w["stats"].get("range", 0) for w in weapons), default=0)
         exposed = [e for e in enemies if not self.arena or not self.arena.screened(pos, e["pos"])]
 
+        multiplier = 1 + min(me["cubes"], self.cube_rules["stat_cap"]) * self.cube_rules["damage_per_cube"]
+
         def target_cost(enemy):
             dist = distance(pos, enemy["pos"])
             hp = enemy.get("hp", math.inf)
-            # Prioritize a possible elimination with the loaded arm gun. Spending
-            # a magazine on a healthy opponent can let the damaged one regenerate.
-            finish = (gun and gun.get("ammo", 0) >= 2 and gun.get("reload", 0) <= 0
-                      and dist <= gun["stats"]["range"]
-                      and hp <= gun["stats"]["damage"] * 1.5)
+            priority = finish_priority(me, enemy, dist, multiplier, urgent)
             hp_fraction = hp / max(1, enemy.get("max_hp", 1400)) if math.isfinite(hp) else 1
-            return (dist > gun_range, not finish,
+            return (dist > gun_range, priority,
                     dist + 85 * hp_fraction - 20 * (enemy["id"] == self.target_id))
 
         target = min(exposed or enemies, key=target_cost, default=None)
@@ -407,15 +414,15 @@ class Bot:
             action["aim"] = [math.atan2(target["pos"][1] - pos[1], target["pos"][0] - pos[0]), 0.0]
             behind_cover = bool(enemies and not exposed)
             if not behind_cover:
-                action.update(engage(me, target, urgent))
+                action.update(engage(me, target, urgent, multiplier))
         if watch_bearing:
             action["aim"] = [self.awareness.bearing, 0.0]
-        # The game's five-second sight memory can outlast a whole reload.
-        # Top up while the remembered opponent is behind a building.
-        if not target or (enemies and not exposed):
-            gun = next((w for w in me["weapons"] if w and w["kind"] == "gun"), None)
-            action["reload"] = bool(gun and gun.get("reload", 0) <= 0
-                                    and gun["ammo"] < gun["stats"]["mag"] * 0.65)
+        reload_contacts = exposed
+        if target and not enemies:
+            reload_contacts = [target]
+        calm_travel = (gun and not target and not watch_bearing and goal is not None
+                       and distance(pos, goal) > me["stats"]["boost_speed"] * (gun["stats"]["reload"] + 0.5))
+        action["reload"] = reload_window(me, gun, reload_contacts, action, calm_travel)
         return action
 
 

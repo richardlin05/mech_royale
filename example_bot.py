@@ -22,6 +22,18 @@ def direction(a, b):
     return [(b[i] - a[i]) / length for i in range(2)]
 
 
+def reserve_arc_energy(me, enemy, circle_radius):
+    """Keep battery for lightning during an open retreat in a cramped circle."""
+    arc = next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None)
+    if arc is None:
+        return False
+    reach = arc["stats"]["range"]
+    # Within a second's walk of arc range, a sprint spends the same battery
+    # the arc may need before energy regeneration resumes.
+    return (circle_radius <= 2 * reach
+            and distance(me["pos"], enemy["pos"]) <= reach + me["stats"]["walk_speed"])
+
+
 def reachable_loot_level(pos, spot, arena):
     """Keep pickup-height limits near the mech, but allow travel along sloping ground."""
     if abs(pos[2] - spot[2]) <= 4:
@@ -35,57 +47,6 @@ def reachable_loot_level(pos, spot, arena):
         if not arena.open(cell) or abs(point[2] - arena.ground[cell]) > 2.5:
             return False
     return True
-
-
-class EliminationRewards:
-    """Make a short collection trip for cubes observed near a defeated mech."""
-
-    def __init__(self, config):
-        self.stat_cap = config["cubes"]["stat_cap"]
-        self.pickup_radius = config["cubes"]["pickup_radius"]
-        self.seen = {}
-        self.sites = {}
-
-    def update(self, obs, enemies):
-        now = obs["t"]
-        for enemy in enemies:
-            self.seen[enemy["id"]] = now, tuple(enemy["pos"])
-        self.sites = {key: site for key, site in self.sites.items() if now < site[0]}
-        defeated = {e["target"] for e in obs["events"] if e["type"] == "kill"}
-        for actor_id in defeated:
-            seen = self.seen.pop(actor_id, None)
-            if seen and now - seen[0] <= 1:
-                self.sites[actor_id] = now + 9, seen[1]
-        if any(e["type"] == "damaged" and e.get("by") not in defeated for e in obs["events"]):
-            self.sites.clear()
-
-    def goal(self, obs, enemies, radius, arena):
-        me, zone, now = obs["self"], obs["zone"], obs["t"]
-        if (not self.sites or not me["in_zone"] or me["cubes"] >= self.stat_cap
-                or any(d["holder"] == me["id"] for d in obs.get("drops", []))):
-            return None
-        pos, stats = me["pos"], me["stats"]
-        best, best_cost = None, math.inf
-        for cube in obs["cubes"]:
-            spot = cube["pos"]
-            travel = distance(pos, spot)
-            eta = 1.5 * travel / stats["walk_speed"]
-            if not any(now + eta < until and math.dist(spot, site) <= 4 * self.pickup_radius
-                       for until, site in self.sites.values()):
-                continue
-            if not reachable_loot_level(pos, spot, arena):
-                continue
-            center, edge = forecast(zone, now, eta + 2)
-            inward = max(0, distance(spot, zone["next_center"]) - radius)
-            if (distance(spot, center) + stats["radius"] >= edge
-                    or (inward > 0 and now + eta + 1.5 * inward / stats["walk_speed"] + 3 >= zone["shrink_end"])):
-                continue
-            if any(distance(spot, e["pos"]) <= stats["boost_speed"] * (eta + 1)
-                   or distance(pos, e["pos"]) <= 3 * stats["walk_speed"] for e in enemies):
-                continue
-            if travel < best_cost:
-                best, best_cost = spot, travel
-        return best
 
 
 def loot_goal(obs, center, radius, arena=None):
@@ -319,7 +280,6 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         self.equipment = Equipment(hello["config"])
         self.resources = ResourceMemory(hello["config"])
-        self.rewards = EliminationRewards(hello["config"])
         self.first_loadout = FirstLoadout()
         self.zone_policy = ZonePolicy()
         self.side = 1 if hello["slot"] % 2 else -1
@@ -346,7 +306,6 @@ class Bot:
         radius = max(0, zone["next_radius"] - min(15, zone["next_radius"] * 0.2))
         enemies = sorted((e for e in obs["mechs"] if e["kind"] == "mech"),
                          key=lambda e: distance(pos, e["pos"]))
-        self.rewards.update(obs, enemies)
         hurt = me["hp"] < 0.65 * me["max_hp"]
         crowded = sum(distance(pos, e["pos"]) < 110 for e in enemies) >= 2
         retreat = bool(enemies) and (hurt or crowded)
@@ -413,19 +372,12 @@ class Bot:
                 self.cover_goal = None
         if self.cover_goal is not None:
             goal = self.cover_goal
-        reward = None
-        if self.cover_goal is None and not urgent:
-            reward = self.rewards.goal(resource_obs, enemies, radius, self.arena)
-            if reward is not None:
-                goal = reward
-                move = direction(pos, goal)
         # Commit to the next waypoint for travel. Keep free strafing in a duel.
-        collection = first_weapon is not None or reward is not None
-        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal or collection):
+        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal or first_weapon is not None):
             waypoint = self.arena.waypoint(pos, goal, t)
             move = direction(pos, waypoint)
         duel_sprint = False
-        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent and not collection:
+        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent and first_weapon is None:
             reward = duel_loot_goal(resource_obs, enemies[0], self.arena)
             if reward is not None:
                 move = direction(pos, reward)
@@ -451,8 +403,11 @@ class Bot:
             self.recharging = True
         elif me["energy"] >= me["max_energy"] * 0.65:
             self.recharging = False
+        # Storm travel and routes to shelter still get the normal sprint.
+        retreat_boost = retreat and (rotate or self.cover_goal is not None
+                                     or not reserve_arc_energy(me, enemies[0], zone["next_radius"]))
         # In the air the same input jets upward. Save it for obstacle recovery.
-        sprint = me["grounded"] and (retreat or storm_urgent or duel_sprint)
+        sprint = me["grounded"] and (retreat_boost or storm_urgent or duel_sprint)
         action = {"tick": obs["tick"], "move": move, "jump": bool(detour and me["grounded"]),
                   "boost": self.last_moving and not self.recharging and (sprint or detour),
                   "aim": [math.remainder(t * 0.75, math.tau), 0.0]}

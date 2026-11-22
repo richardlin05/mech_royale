@@ -6,7 +6,7 @@ from arena_nav import Arena
 from awareness import Awareness
 from duel_spacing import duel_advance
 from equipment import Equipment
-from resource_policy import FirstLoadout, ResourceMemory, drop_cost
+from resource_policy import FirstLoadout, ResourceMemory, SupplyRun, drop_cost
 from zone_policy import ZonePolicy, forecast, needs_sprint
 from recovery import Recovery
 
@@ -37,6 +37,52 @@ def reachable_loot_level(pos, spot, arena):
     return True
 
 
+def straight_walk(arena, pos, spot):
+    """Check the local walking edges, including diagonal corners and slopes."""
+    travel = distance(pos, spot)
+    steps = max(1, math.ceil(travel / (arena.step * 0.5)))
+    here = arena.cell(pos)
+    if not arena.open(here):
+        return False
+    for n in range(1, steps + 1):
+        cell = arena.cell((pos[0] + n / steps * (spot[0] - pos[0]),
+                           pos[1] + n / steps * (spot[1] - pos[1])))
+        if not arena.open(cell) or (cell != here and not arena.walkable_step(here, cell)):
+            return False
+        here = cell
+    return True
+
+
+def crate_position(me, crate, center, radius, arena):
+    """Stay far enough from an unopened crate for the torso to tilt down."""
+    spot, pos = crate["pos"], me["pos"]
+    if any(w and w["kind"] == "lightning" and me["energy"] > w["stats"]["energy"] + 12
+           for w in me["weapons"]):
+        return spot
+    stats = me["stats"]
+    vertical = max(0, pos[2] + stats["muzzle_height"] - spot[2])
+    # Aim for its feet to leave clearance for the crate height and braking.
+    stand = vertical / math.tan(-stats["min_pitch"]) + 2
+    dist = distance(pos, spot)
+    if dist > stand + 8:
+        return spot
+    angle = math.atan2(pos[1] - spot[1], pos[0] - spot[0])
+    for turn in (0, 0.5, -0.5, 1, -1, math.pi):
+        point = spot[0] + stand * math.cos(angle + turn), spot[1] + stand * math.sin(angle + turn)
+        if arena is not None:
+            cell = arena.cell(point)
+            if not arena.open(cell):
+                continue
+            point = (*arena.point(cell), arena.ground[cell])
+            if (math.atan2(spot[2] - point[2] - stats["muzzle_height"], distance(point, spot))
+                    < stats["min_pitch"] or arena.screened(point, spot)
+                    or not straight_walk(arena, pos, point)):
+                continue
+        if distance(point, center) <= radius:
+            return point
+    return spot
+
+
 def loot_goal(obs, center, radius, arena=None):
     me = obs["self"]
     pos = me["pos"]
@@ -55,10 +101,14 @@ def loot_goal(obs, center, radius, arena=None):
                 and travel < 150 and distance(drop["pos"], center) <= radius):
             options.append((drop_cost(me, drop, travel, me["stats"]["walk_speed"]), drop["pos"]))
     if not options:
+        crates = []
         for crate in obs["crates"]:
             if distance(pos, crate["pos"]) < 90 and reachable_loot_level(pos, crate["pos"], arena):
                 if distance(crate["pos"], center) <= radius:
-                    options.append((distance(pos, crate["pos"]), crate["pos"]))
+                    crates.append(crate)
+        if crates:
+            nearest = min(crates, key=lambda c: distance(pos, c["pos"]))
+            return crate_position(me, nearest, center, radius, arena)
     return min(options)[1] if options else None
 
 
@@ -85,6 +135,30 @@ def early_loot(obs, center, radius, arena=None):
         if 2 * (outward + inward) / me["stats"]["walk_speed"] + 8 < remaining:
             options.append((outward - item.get("route_bonus", 0), item["id"], spot))
     return min(options)[2] if options else None
+
+
+def supply_waypoint(obs, drop, arena):
+    """Spend spare arrival time on a nearby cube or the first secondary."""
+    me, spot = obs["self"], drop["pos"]
+    pos, speed = me["pos"], me["stats"]["walk_speed"]
+    direct = distance(pos, spot)
+    if direct <= drop["radius"] or drop["holder"] == me["id"]:
+        return spot
+    items = list(obs["cubes"])
+    if None in me["weapons"]:
+        items.extend(p for p in obs["pickups"] if p["kind"] != "gun")
+    options = []
+    for item in items:
+        point = item["pos"]
+        detour = distance(pos, point)
+        if (detour > 2 * speed or not reachable_loot_level(pos, point, arena)
+                or distance(point, obs["zone"]["center"]) + me["stats"]["radius"] > obs["zone"]["radius"]):
+            continue
+        extra = detour + distance(point, spot) - direct
+        slack = speed * drop["lands_in"] / 1.35 - max(0, direct - drop["radius"])
+        if extra <= max(3, min(slack, 2 * speed)):
+            options.append((detour, item["id"], point))
+    return min(options)[2] if options else spot
 
 
 def duel_loot_goal(obs, enemy, arena):
@@ -140,23 +214,8 @@ def duel_loot_goal(obs, enemy, arena):
             time_needed = 2 * (travel + excess) / speed + dwell + 4
             if zone["shrink_start"] - obs["t"] <= time_needed:
                 continue
-        if arena:
-            # Only divert on a locally walkable line; keep the existing route around walls.
-            steps = max(1, math.ceil(travel / (arena.step * 0.5)))
-            here = arena.cell(pos)
-            clear = arena.open(here)
-            for n in range(1, steps + 1):
-                cell = arena.cell((pos[0] + n / steps * (spot[0] - pos[0]),
-                                   pos[1] + n / steps * (spot[1] - pos[1])))
-                if not clear or not arena.open(cell):
-                    clear = False
-                    break
-                if cell != here and not arena.walkable_step(here, cell):
-                    clear = False
-                    break
-                here = cell
-            if not clear:
-                continue
+        if arena and not straight_walk(arena, pos, spot):
+            continue
         cost = travel + bonus
         if cost < best_cost:
             best_cost, best = cost, spot
@@ -268,6 +327,7 @@ class Bot:
     def __init__(self, hello: mf.Hello):
         self.equipment = Equipment(hello["config"])
         self.resources = ResourceMemory(hello["config"])
+        self.supply = SupplyRun(hello["config"])
         self.first_loadout = FirstLoadout()
         self.zone_policy = ZonePolicy()
         self.side = 1 if hello["slot"] % 2 else -1
@@ -360,12 +420,19 @@ class Bot:
                 self.cover_goal = None
         if self.cover_goal is not None:
             goal = self.cover_goal
+        supply = self.supply.select(obs, enemies, storm_urgent or retreat or
+                                    self.cover_goal is not None or first_weapon is not None)
+        if supply is not None:
+            goal = supply_waypoint(resource_obs, supply, self.arena) if not enemies else supply["pos"]
+            move = direction(pos, goal)
+        collecting = first_weapon is not None or supply is not None
         # Commit to the next waypoint for travel. Keep free strafing in a duel.
-        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal or first_weapon is not None):
+        if self.arena and goal is not None and (rotate or not enemies or self.cover_goal
+                                                or collecting):
             waypoint = self.arena.waypoint(pos, goal, t)
             move = direction(pos, waypoint)
         duel_sprint = False
-        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent and first_weapon is None:
+        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent and not collecting:
             reward = duel_loot_goal(resource_obs, enemies[0], self.arena)
             if reward is not None:
                 move = direction(pos, reward)

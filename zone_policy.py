@@ -1,4 +1,5 @@
 """Choose walking destinations inside the game's moving safe circle."""
+import heapq
 import math
 
 
@@ -33,9 +34,11 @@ class ZonePolicy:
     def __init__(self):
         self.patrol_goal = None
         self.patrol_until = 0
+        self.entry_goal = None
+        self.entry_until = 0
+        self.next_entry_search = 0
 
-    @staticmethod
-    def entry(obs, radius, arena):
+    def entry(self, obs, radius, arena):
         """Enter the near side of the circle using open ground where available."""
         me, zone = obs["self"], obs["zone"]
         if me["in_zone"]:
@@ -46,6 +49,21 @@ class ZonePolicy:
         radius = max(0, radius - min(12, radius * 0.35))
         if math.dist(pos, center) < radius:
             return center
+        if arena is not None and (not me["in_zone"] or obs["t"] >= zone["shrink_start"]):
+            if (self.entry_goal is not None and obs["t"] < self.entry_until
+                    and math.dist(self.entry_goal, center) <= radius
+                    and arena.open(arena.cell(self.entry_goal))):
+                return self.entry_goal
+            origin = arena.cell(pos)
+            if obs["t"] >= self.next_entry_search and arena.open(origin):
+                # A very small circle may lie entirely inside a building.
+                # Let the existing near-side fallback steer between attempts.
+                self.next_entry_search = obs["t"] + 0.5
+                destination = self.reachable_entry(arena, origin, center, radius)
+                if destination is not None:
+                    self.entry_goal = destination
+                    self.entry_until = obs["t"] + 5
+                    return destination
         angle = math.atan2(pos[1] - center[1], pos[0] - center[0])
         best, best_dist = None, math.inf
         for offset in (0, 0.16, -0.16, 0.4, -0.4, 0.85, -0.85):
@@ -64,6 +82,31 @@ class ZonePolicy:
                 if travel < best_dist:
                     best_dist, best = travel, point
         return best if best is not None else center
+
+    @staticmethod
+    def reachable_entry(arena, origin, center, radius):
+        """Look for the first walkable crossing of the circle, including detours around walls."""
+        required = min(arena.body_radius, arena.clearance_limit)
+        scale = arena.step
+        cx, cy = (center[0] - arena.x) / scale, (center[1] - arena.y) / scale
+        radius /= scale
+        queue = [(0, 0, origin)]
+        best = {origin: 0}
+        for _ in range(650):
+            if not queue:
+                break
+            _, steps, cell = heapq.heappop(queue)
+            if best[cell] != steps:
+                continue
+            if math.hypot(cell[0] - cx, cell[1] - cy) <= radius:
+                return arena.point(cell)
+            for neighbor, length, clearance in arena.walk_edges[cell]:
+                dist = steps + length
+                if clearance >= required and dist < best.get(neighbor, math.inf):
+                    best[neighbor] = dist
+                    to_circle = max(0, math.hypot(neighbor[0] - cx, neighbor[1] - cy) - radius)
+                    heapq.heappush(queue, (dist + 1.35 * to_circle, dist, neighbor))
+        return None
 
     def patrol(self, obs, center, radius, side, arena):
         """Keep one walkable search destination long enough to route around a wall."""

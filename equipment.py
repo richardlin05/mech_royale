@@ -12,7 +12,6 @@ class Equipment:
         self.upgrades = {u["id"]: u for u in config["upgrades"]}
         self.weapons = config["weapons"]
         self.pickup_radius = config["loot"]["pickup_radius"]
-        self.equip_time = config["loot"]["equip_s"]
 
     def upgrade(self, choices, me, enemies):
         # Protect an injured mech first; prioritize recovery when out of contact.
@@ -98,19 +97,8 @@ class Equipment:
             return {}
         old_value = value(current["kind"], current["stats"])
         new_value = rank(best)[0]
-        if new_value <= max(20, 1.4 * old_value):
+        # Keep a serviceable secondary during a fight. Switch if it cannot reach,
+        # or if the next matchup is quiet and the upgrade is substantial.
+        if new_value <= max(20, 1.4 * old_value) or (enemy and old_value > 0):
             return {}
-        if enemy and old_value > 0:
-            # A strong counter can pay for its equip delay during a sustained
-            # encounter. Keep the ready item for a short engagement.
-            counters_enemy = ((best["kind"] == "laser" and "mortar" in enemy.get("weapons", ())) or
-                              (best["kind"] == "lightning" and "laser" in enemy.get("weapons", ())))
-            if not counters_enemy:
-                return {}
-            gun = next((w for w in slots if w and w["kind"] == "gun"), None)
-            combined = old_value + (cycle_damage(gun["stats"]) if gun else 0)
-            horizon = min(4.0, enemy.get("hp", 0) / max(1, combined))
-            delay = max(self.equip_time, self.weapons[best["kind"]]["cooldown"])
-            if (horizon - delay) * new_value < 1.15 * horizon * old_value:
-                return {}
         return {"drop": slot, "take": best["id"]}

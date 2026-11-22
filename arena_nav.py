@@ -38,10 +38,6 @@ class Arena:
         self.solids = {}
         self.blocked = set()
         self.body_radius = 2.5
-        self.body_height = 9.0
-        self.headroom = {}
-        self.bounds = bounds
-        self.prisms_by_tile = {}
         # Distances within one grid step of even a large mech's hull are
         # computed at startup, so route expansion only needs a dictionary lookup.
         self.clearance = {}
@@ -56,11 +52,6 @@ class Arena:
                                            self.clearance_limit)
         for prism in world["prisms"]:
             ring = prism["ring"]
-            # Physical footprints near the final goal can differ from the tile center.
-            pad = self.clearance_limit
-            for tx in range(math.floor((min(ring[::2]) - pad) / 30), math.floor((max(ring[::2]) + pad) / 30) + 1):
-                for ty in range(math.floor((min(ring[1::2]) - pad) / 30), math.floor((max(ring[1::2]) + pad) / 30) + 1):
-                    self.prisms_by_tile.setdefault((tx, ty), []).append(prism)
             for boundary in (ring, *prism["holes"]):
                 self.add_wall_clearance(boundary, prism["base"], prism["top"])
             low = self.cell((min(ring[::2]), min(ring[1::2])))
@@ -76,19 +67,13 @@ class Arena:
                     base, top = prism["base"], prism["top"]
                     self.solids.setdefault(cell, []).append((base, top))
                     ground = self.ground[cell]
-                    if top > ground + 1.2:
-                        if base < ground + 9:
-                            self.blocked.add(cell)
-                        else:
-                            self.headroom[cell] = min(base - ground, self.headroom.get(cell, math.inf))
+                    if top > ground + 1.2 and base < ground + 9:
+                        self.blocked.add(cell)
         self.walk_edges = self.build_walk_edges(terrain, elevation)
-        self.regions = self.build_regions()
-        self.pending = None
         self.path = []
         self.destination = None
         self.anchor = None
         self.route_radius = self.body_radius
-        self.route_height = self.body_height
         self.replan_at = 0
 
     def build_walk_edges(self, terrain, elevation):
@@ -136,49 +121,6 @@ class Arena:
                     edges[there].append((here, length, clearance))
         return edges
 
-    def build_regions(self):
-        # Weak connectivity at spawn size rules out permanently disconnected goals.
-        # A label match is necessary; the directed planner still checks slope and size.
-        parent = {c: c for c in self.walk_edges}
-        def root(cell):
-            while parent[cell] != cell:
-                parent[cell] = parent[parent[cell]]
-                cell = parent[cell]
-            return cell
-        for cell, edges in self.walk_edges.items():
-            leader = root(cell)
-            for neighbor, _, gap in edges:
-                if gap >= self.body_radius:
-                    other = root(neighbor)
-                    if other != leader:
-                        parent[other] = leader
-        return {cell: root(cell) for cell in parent}
-
-    def point_fits(self, point):
-        cell = self.cell(point)
-        x, y = point[:2]
-        r = self.body_radius
-        b = self.bounds
-        if min(x-b["minX"], b["maxX"]-x, y-b["minY"], b["maxY"]-y) < r or cell not in self.ground:
-            return False
-        ground = self.ground[cell]
-        for prism in self.prisms_by_tile.get((math.floor(x / 30), math.floor(y / 30)), ()):
-            if prism["top"] <= ground + 1.2 or prism["base"] >= ground + self.body_height:
-                continue
-            ring, holes = prism["ring"], prism["holes"]
-            if inside(x, y, ring) and not any(inside(x, y, h) for h in holes):
-                return False
-            for boundary in (ring, *holes):
-                ax, ay = boundary[-2:]
-                for bx, by in zip(boundary[::2], boundary[1::2]):
-                    dx, dy = bx-ax, by-ay
-                    length2 = dx*dx + dy*dy
-                    u = max(0, min(1, ((x-ax)*dx + (y-ay)*dy) / length2)) if length2 else 0
-                    if (x-ax-u*dx)**2 + (y-ay-u*dy)**2 < r*r:
-                        return False
-                    ax, ay = bx, by
-        return True
-
     def add_wall_clearance(self, ring, base, top):
         """Find nearby grid points where the edge can collide with a walking mech."""
         ax, ay = ring[-2:]
@@ -208,13 +150,10 @@ class Arena:
         return self.x + cell[0] * self.step, self.y + cell[1] * self.step
 
     def open(self, cell):
-        return (cell not in self.blocked and self.clearance.get(cell, -1) >= min(self.body_radius, self.clearance_limit)
-                and self.headroom.get(cell, math.inf) >= self.body_height)
+        return cell not in self.blocked and self.clearance.get(cell, -1) >= min(self.body_radius, self.clearance_limit)
 
     def walkable_step(self, start, end):
         required = min(self.body_radius, self.clearance_limit)
-        if self.body_height > 9 and self.headroom.get(end, math.inf) < self.body_height:
-            return False
         return any(cell == end and gap >= required for cell, _, gap in self.walk_edges.get(start, ()))
 
     def screened(self, pos, enemy):
@@ -263,7 +202,7 @@ class Arena:
                     best, best_cost = spot, cost
             for neighbor, length, gap in self.walk_edges[cell]:
                 new = steps + length
-                if gap >= required and self.headroom.get(neighbor, math.inf) >= self.body_height and new < paths.get(neighbor, math.inf):
+                if gap >= required and new < paths.get(neighbor, math.inf):
                     paths[neighbor] = new
                     heapq.heappush(queue, (new, neighbor))
         return best
@@ -281,21 +220,17 @@ class Arena:
                       if self.open(cell))
             return min(points, key=lambda p: math.dist(pos[:2], p), default=pos)
         end = requested
-        region = self.regions[start]
-        if not self.open(end) or self.regions.get(end) != region:
+        if not self.open(end):
             nearby = ((end[0] + dx, end[1] + dy) for dx in range(-4, 5) for dy in range(-4, 5))
-            end = min((c for c in nearby if self.open(c) and self.regions.get(c) == region),
+            end = min((c for c in nearby if self.open(c)),
                       key=lambda c: math.dist(self.point(c), goal[:2]), default=requested)
         if start == end:
             # A blocked goal such as a zone center inside a building has a safe
             # substitute. Stay at that point once reached.
-            return goal if end == requested and self.point_fits(goal) else self.point(end)
+            return goal if end == requested else self.point(end)
 
         off_path = start != self.anchor and (not self.path or start != self.path[-1])
-        continuing = not self.path and self.pending is not None
-        if (self.destination != end or now >= self.replan_at or off_path or continuing
-                or self.route_radius != self.body_radius or self.route_height != self.body_height):
-            self.route_height = self.body_height
+        if self.destination != end or now >= self.replan_at or off_path or self.route_radius != self.body_radius:
             self.route_radius = self.body_radius
             self.destination, self.replan_at = end, now + 1.5
             self.anchor = start
@@ -308,14 +243,9 @@ class Arena:
 
     def route(self, start, end):
         # Bound work per observation. A partial route still advances toward the goal.
-        key = (start, end, self.body_radius, self.body_height)
-        if self.pending is not None and self.pending[0] == key:
-            _, queue, cost, parent, best = self.pending
-        else:
-            queue = [(math.dist(start, end), 0, start)]
-            cost, parent = {start: 0}, {}
-            best = start
-        self.pending = None
+        queue = [(math.dist(start, end), 0, start)]
+        cost, parent = {start: 0}, {}
+        best = start
         required = min(self.body_radius, self.clearance_limit)
         for _ in range(800):
             if not queue:
@@ -328,14 +258,12 @@ class Arena:
             if here == end:
                 break
             for there, step, gap in self.walk_edges.get(here, ()):
-                if gap < required or self.headroom.get(there, math.inf) < self.body_height:
+                if gap < required:
                     continue
                 new = g + step
                 if new < cost.get(there, math.inf):
                     cost[there], parent[there] = new, here
                     heapq.heappush(queue, (new + 1.3 * math.dist(there, end), new, there))
-        if queue and best != end:
-            self.pending = (key, queue, cost, parent, best)
         path = []
         while best != start:
             path.append(best)

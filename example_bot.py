@@ -3,7 +3,10 @@ import math
 
 import mechfight as mf
 from arena_nav import Arena
+from awareness import Awareness
 from equipment import Equipment
+from resource_policy import ResourceMemory, drop_cost
+from zone_policy import ZonePolicy, forecast, needs_sprint
 
 
 def distance(a, b):
@@ -35,7 +38,7 @@ def reachable_loot_level(pos, spot, arena):
 def loot_goal(obs, center, radius, arena=None):
     me = obs["self"]
     pos = me["pos"]
-    items = [(c, -8) for c in obs["cubes"]]
+    items = [(c, -8 - c.get("route_bonus", 0)) for c in obs["cubes"]]
     if None in me["weapons"]:
         items.extend((p, 5) for p in obs["pickups"] if p["kind"] != "gun")
     options = [(distance(pos, item["pos"]) + penalty, item["pos"])
@@ -48,7 +51,7 @@ def loot_goal(obs, center, radius, arena=None):
         arrival = travel / max(1, me["stats"]["walk_speed"])
         if (drop["lands_in"] <= arrival + 3 and drop["holder"] in (None, me["id"])
                 and travel < 150 and distance(drop["pos"], center) <= radius):
-            options.append((travel * 0.55 - 32, drop["pos"]))
+            options.append((drop_cost(me, drop, travel, me["stats"]["walk_speed"]), drop["pos"]))
     if not options:
         for crate in obs["crates"]:
             if distance(pos, crate["pos"]) < 90 and reachable_loot_level(pos, crate["pos"], arena):
@@ -78,7 +81,7 @@ def early_loot(obs, center, radius, arena=None):
         inward = max(0, distance(spot, center) - radius)
         # Allow twice the direct walking time for buildings, plus an eight-second buffer.
         if 2 * (outward + inward) / me["stats"]["walk_speed"] + 8 < remaining:
-            options.append((outward, item["id"], spot))
+            options.append((outward - item.get("route_bonus", 0), item["id"], spot))
     return min(options)[2] if options else None
 
 
@@ -95,7 +98,7 @@ def duel_loot_goal(obs, enemy, arena):
 
     options = []
     for item in obs["cubes"]:
-        options.append((item["pos"], 0.0, 0.0))
+        options.append((item["pos"], 0.0, -item.get("route_bonus", 0)))
     if None in me["weapons"]:
         for item in obs["pickups"]:
             if item["kind"] != "gun":
@@ -113,7 +116,8 @@ def duel_loot_goal(obs, enemy, arena):
             angle = obs["t"] * 1.5
             spot = [spot[0] + math.cos(angle) * drop["radius"] * 0.5,
                     spot[1] + math.sin(angle) * drop["radius"] * 0.5, spot[2]]
-        options.append((spot, left, -16.0))
+        travel = distance(pos, spot)
+        options.append((spot, left, drop_cost(me, drop, travel, speed) - travel))
 
     best, best_cost = None, float("inf")
     toward_enemy = direction(pos, opponent)
@@ -145,7 +149,7 @@ def duel_loot_goal(obs, enemy, arena):
                 if not clear or not arena.open(cell):
                     clear = False
                     break
-                if cell != here and abs(arena.ground[cell] - arena.ground[here]) > arena.step * math.dist(cell, here) * 1.19:
+                if cell != here and not arena.walkable_step(here, cell):
                     clear = False
                     break
                 here = cell
@@ -168,11 +172,7 @@ def can_finish_drop(obs, enemies):
         if left > 1.5 or not me["in_zone"]:
             continue
         zone = obs["zone"]
-        shrink_from = max(obs["t"], zone["shrink_start"])
-        shrinking_for = max(0, obs["t"] + left - shrink_from)
-        fraction = min(1, shrinking_for / max(0.001, zone["shrink_end"] - shrink_from))
-        center = [a + fraction * (b - a) for a, b in zip(zone["center"], zone["next_center"])]
-        radius = zone["radius"] + fraction * (zone["next_radius"] - zone["radius"])
+        center, radius = forecast(zone, obs["t"], left)
         if distance(me["pos"], center) + 1 > radius:
             continue
         # Leave if an observed mech could contest the ring before the reward arrives.
@@ -265,18 +265,17 @@ class Bot:
 
     def __init__(self, hello: mf.Hello):
         self.equipment = Equipment(hello["config"])
+        self.resources = ResourceMemory(hello["config"])
+        self.zone_policy = ZonePolicy()
         self.side = 1 if hello["slot"] % 2 else -1
         try:
             self.arena = Arena(hello["map"]["dir"])
         except (OSError, ValueError, KeyError, IndexError):
             self.arena = None
-        self.crate_height = hello["config"]["crates"]["height"] / 2
-        self.npc_height = hello["config"]["npc"]["height"] / 2
+        self.awareness = Awareness(hello["config"])
         self.cover_goal = None
         self.next_cover_search = 0
         self.target_id = None
-        self.last_hit_bearing = None
-        self.watch_bearing_until = -1
         self.sample = None
         self.detour_until = -1
         self.last_moving = False
@@ -284,6 +283,7 @@ class Bot:
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me, zone, t = obs["self"], obs["zone"], obs["t"]
+        resource_obs = self.resources.route_view(obs)
         pos, center = me["pos"], zone["next_center"]
         if self.arena is not None:
             self.arena.body_radius = me["stats"]["radius"]
@@ -296,12 +296,12 @@ class Bot:
         rotate = not me["in_zone"] or distance(pos, center) > radius
         # Traveling toward a future circle can start a full minute before
         # the shrink. Reserve full speed for escapes and imminent closures.
-        urgent = (not me["in_zone"] or retreat
-                  or (rotate and zone["shrink_end"] - t <
-                      5 + 1.8 * max(0, distance(pos, center) - radius) / me["stats"]["walk_speed"]))
-        goal = center if rotate else loot_goal(obs, center, radius, self.arena)
-        if rotate and not enemies:
-            detour_goal = early_loot(obs, center, radius, self.arena)
+        storm_urgent = needs_sprint(obs, radius)
+        urgent = retreat or storm_urgent
+        goal = (self.zone_policy.entry(obs, radius, self.arena) if rotate
+                else loot_goal(resource_obs, center, radius, self.arena))
+        if rotate and not enemies and not storm_urgent:
+            detour_goal = early_loot(resource_obs, center, radius, self.arena)
             if detour_goal is not None:
                 goal = detour_goal
         move = direction(pos, goal) if goal is not None else [0.0, 0.0]
@@ -323,11 +323,8 @@ class Bot:
                     inward = direction(pos, center)
                     move = direction((0, 0), [inward[i] + 0.45 * lateral[i] for i in range(2)])
         elif goal is None and radius > 8:
-            # Search for resources along a circuit inside the next circle.
-            orbit = min(radius * 0.7, 85)
-            angle = math.atan2(pos[1] - center[1], pos[0] - center[0]) + self.side * 0.5
-            move = direction(pos, [center[0] + orbit * math.cos(angle),
-                                   center[1] + orbit * math.sin(angle)])
+            goal = self.zone_policy.patrol(obs, center, radius, self.side, self.arena)
+            move = direction(pos, goal)
 
         # Use physical cover to buy time for regeneration under pressure.
         if self.arena and retreat and not rotate:
@@ -342,8 +339,8 @@ class Bot:
         if self.arena and goal is not None and (rotate or not enemies or self.cover_goal):
             waypoint = self.arena.waypoint(pos, goal, t)
             move = direction(pos, waypoint)
-        if len(enemies) == 1 and self.cover_goal is None:
-            reward = duel_loot_goal(obs, enemies[0], self.arena)
+        if len(enemies) == 1 and self.cover_goal is None and not storm_urgent:
+            reward = duel_loot_goal(resource_obs, enemies[0], self.arena)
             if reward is not None:
                 move = direction(pos, reward)
         if self.sample is None or t - self.sample[0] >= 0.8:
@@ -365,7 +362,7 @@ class Bot:
         elif me["energy"] >= me["max_energy"] * 0.65:
             self.recharging = False
         # In the air the same input jets upward. Save it for obstacle recovery.
-        sprint = me["grounded"] and (retreat or not me["in_zone"])
+        sprint = me["grounded"] and (retreat or storm_urgent)
         action = {"tick": obs["tick"], "move": move, "jump": bool(detour and me["grounded"]),
                   "boost": self.last_moving and not self.recharging and (sprint or detour),
                   "aim": [math.remainder(t * 0.75, math.tau), 0.0]}
@@ -392,30 +389,17 @@ class Bot:
 
         target = min(exposed or enemies, key=target_cost, default=None)
         self.target_id = target["id"] if target else None
-        # Damage bearings point toward the source even when it is outside our field of view.
-        for event in obs["events"]:
-            if (event["type"] == "damaged" and event.get("bearing") is not None
-                    and event["weapon"] in ("gun", "laser", "lightning", "mortar")
-                    and event.get("by") != me["id"]):
-                self.last_hit_bearing = event["bearing"]
-                self.watch_bearing_until = t + 1.2
-        watch_bearing = not exposed and t < self.watch_bearing_until
-        if not target and not watch_bearing and not hurt and me["in_zone"]:
-            crates = [c for c in obs["crates"] if distance(pos, c["pos"]) < 90]
-            if crates:
-                target = dict(min(crates, key=lambda c: distance(pos, c["pos"])), vel=[0, 0, 0],
-                              aim_height=self.crate_height)
-            else:
-                drones = [e for e in obs["mechs"] if e["kind"] == "npc" and distance(pos, e["pos"]) < 70]
-                if drones:
-                    target = dict(min(drones, key=lambda e: distance(pos, e["pos"])), aim_height=self.npc_height)
+        self.awareness.update(obs)
+        watch_bearing = not exposed and t < self.awareness.look_until
+        if not target and not watch_bearing and me["in_zone"]:
+            target = self.awareness.farm_target(obs, self.arena)
         if target:
             action["aim"] = [math.atan2(target["pos"][1] - pos[1], target["pos"][0] - pos[0]), 0.0]
             behind_cover = bool(enemies and not exposed)
             if not behind_cover:
                 action.update(engage(me, target, urgent))
         if watch_bearing:
-            action["aim"] = [self.last_hit_bearing, 0.0]
+            action["aim"] = [self.awareness.bearing, 0.0]
         # The game's five-second sight memory can outlast a whole reload.
         # Top up while the remembered opponent is behind a building.
         if not target or (enemies and not exposed):

@@ -69,11 +69,57 @@ class Arena:
                     ground = self.ground[cell]
                     if top > ground + 1.2 and base < ground + 9:
                         self.blocked.add(cell)
+        self.walk_edges = self.build_walk_edges(terrain, elevation)
         self.path = []
         self.destination = None
         self.anchor = None
         self.route_radius = self.body_radius
         self.replan_at = 0
+
+    def build_walk_edges(self, terrain, elevation):
+        """Sample each walking edge at the native terrain spacing before play."""
+        nx, ny = terrain["nx"], terrain["ny"]
+        def height(x, y):
+            tx = (x - terrain["minX"]) / terrain["step"]
+            ty = (y - terrain["minY"]) / terrain["step"]
+            col = min(nx - 2, max(0, int(tx)))
+            row = min(ny - 2, max(0, int(ty)))
+            fx, fy = tx - col, ty - row
+            i = row * nx + col
+            south = elevation[i] * (1 - fx) + elevation[i + 1] * fx
+            north = elevation[i + nx] * (1 - fx) + elevation[i + nx + 1] * fx
+            return terrain["scale"] * (south * (1 - fy) + north * fy)
+
+        edges = {cell: [] for cell in self.ground if cell not in self.blocked}
+        samples = max(1, math.ceil(self.step / terrain["step"]))
+        for here, links in edges.items():
+            i, j = here
+            x, y = self.point(here)
+            initial = height(x, y)
+            for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+                there = i + dx, j + dy
+                if there not in edges:
+                    continue
+                clearance = min(self.clearance[here], self.clearance[there])
+                if dx and dy:
+                    if (i + dx, j) not in edges or (i, j + dy) not in edges:
+                        continue
+                    clearance = min(clearance, self.clearance[i + dx, j], self.clearance[i, j + dy])
+                length = math.hypot(dx, dy)
+                max_rise = self.step * length / samples * 1.19
+                last = initial
+                forward, reverse = True, True
+                for n in range(1, samples + 1):
+                    offset = n * self.step / samples
+                    now = height(x + dx * offset, y + dy * offset)
+                    forward = forward and now - last <= max_rise
+                    reverse = reverse and last - now <= max_rise
+                    last = now
+                if forward:
+                    links.append((there, length, clearance))
+                if reverse:
+                    edges[there].append((here, length, clearance))
+        return edges
 
     def add_wall_clearance(self, ring, base, top):
         """Find nearby grid points where the edge can collide with a walking mech."""
@@ -106,6 +152,10 @@ class Arena:
     def open(self, cell):
         return cell not in self.blocked and self.clearance.get(cell, -1) >= min(self.body_radius, self.clearance_limit)
 
+    def walkable_step(self, start, end):
+        required = min(self.body_radius, self.clearance_limit)
+        return any(cell == end and gap >= required for cell, _, gap in self.walk_edges.get(start, ()))
+
     def screened(self, pos, enemy):
         length = math.dist(pos[:2], enemy[:2])
         steps = max(1, math.ceil(length / self.step))
@@ -118,24 +168,43 @@ class Arena:
         return False
 
     def cover(self, pos, enemies, center, radius):
-        best, best_cost = None, float("inf")
         enemies = enemies[:3]
+        if not enemies:
+            return None
         if math.dist(pos[:2], center) <= radius and all(self.screened(pos, e["pos"]) for e in enemies):
             return pos
         start = self.cell(pos)
-        for dx, dy in self.directions:
-            for stride in (2, 4, 7):
-                cell = start[0] + dx * stride, start[1] + dy * stride
-                if not self.open(cell):
-                    continue
-                x, y = self.point(cell)
-                if math.hypot(x - center[0], y - center[1]) > radius:
-                    continue
+        if start not in self.walk_edges:
+            return None
+        # Explore in walking-distance order. A wall can make a spot ten meters
+        # away take much longer to reach than a nearby doorway on the same side.
+        required = min(self.body_radius, self.clearance_limit)
+        queue = [(0.0, start)]
+        paths = {start: 0.0}
+        best, best_cost = None, math.inf
+        while queue:
+            steps, cell = heapq.heappop(queue)
+            meters = steps * self.step
+            if meters > 40 or meters - 40 * len(enemies) >= best_cost:
+                break
+            if steps != paths[cell]:
+                continue
+            x, y = self.point(cell)
+            # Check nearby cells densely, then use a ten-meter lattice to keep
+            # sight-line sampling bounded during a crowded observation.
+            dx, dy = cell[0] - start[0], cell[1] - start[1]
+            candidate = meters <= 12 or (dx % 2 == 0 and dy % 2 == 0)
+            if cell != start and candidate and math.hypot(x - center[0], y - center[1]) <= radius:
                 spot = x, y, self.ground[cell]
                 hidden = sum(self.screened(spot, e["pos"]) for e in enemies)
-                cost = math.dist(pos[:2], spot[:2]) - hidden * 40
+                cost = meters - 40 * hidden
                 if hidden and cost < best_cost:
                     best, best_cost = spot, cost
+            for neighbor, length, gap in self.walk_edges[cell]:
+                new = steps + length
+                if gap >= required and new < paths.get(neighbor, math.inf):
+                    paths[neighbor] = new
+                    heapq.heappush(queue, (new, neighbor))
         return best
 
     def waypoint(self, pos, goal, now):
@@ -169,6 +238,7 @@ class Arena:
         queue = [(math.dist(start, end), 0, start)]
         cost, parent = {start: 0}, {}
         best = start
+        required = min(self.body_radius, self.clearance_limit)
         for _ in range(800):
             if not queue:
                 break
@@ -179,14 +249,8 @@ class Arena:
                 best = here
             if here == end:
                 break
-            i, j = here
-            for dx, dy in self.directions:
-                there = i + dx, j + dy
-                if not self.open(there) or (dx and dy and
-                        (not self.open((i + dx, j)) or not self.open((i, j + dy)))):
-                    continue
-                step = math.hypot(dx, dy)
-                if abs(self.ground[there] - self.ground[here]) > step * self.step * 1.19:
+            for there, step, gap in self.walk_edges.get(here, ()):
+                if gap < required:
                     continue
                 new = g + step
                 if new < cost.get(there, math.inf):
